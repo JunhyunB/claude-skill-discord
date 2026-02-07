@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# discord-notify — Send messages, files, and embeds to Discord from Claude Code
+#
+# Usage:
+#   discord-notify "message"                            # Text message
+#   discord-notify --embed "title" "desc" [color]       # Embed
+#   discord-notify --file path [message]                # Single file
+#   discord-notify --files path1 path2 ... [-- message] # Multiple files (max 10)
+#   discord-notify --rich '{"embeds":[...]}'            # Raw JSON
+#   discord-notify --handoff "summary"                  # Session handoff
+#   echo "pipe" | discord-notify                        # Stdin input
+#
+# Global options (before other options):
+#   --name "BotName"       Custom bot display name
+#   --avatar "URL"         Custom avatar URL
+#   --thread "ThreadID"    Send to specific thread
+#   --tts                  Enable text-to-speech
+
+set -euo pipefail
+
+WEBHOOK_ENV="$HOME/.claude/discord-webhook.env"
+if [[ ! -f "$WEBHOOK_ENV" ]]; then
+  echo "Error: $WEBHOOK_ENV not found" >&2
+  exit 1
+fi
+source "$WEBHOOK_ENV"
+
+if [[ -z "${DISCORD_WEBHOOK_URL:-}" ]]; then
+  echo "Error: DISCORD_WEBHOOK_URL not set" >&2
+  exit 1
+fi
+
+# --- Global option parsing ---
+BOT_NAME=""
+BOT_AVATAR=""
+THREAD_ID=""
+TTS=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --name)    BOT_NAME="$2"; shift 2 ;;
+    --avatar)  BOT_AVATAR="$2"; shift 2 ;;
+    --thread)  THREAD_ID="$2"; shift 2 ;;
+    --tts)     TTS=true; shift ;;
+    *)         break ;;
+  esac
+done
+
+# Append thread parameter to webhook URL
+webhook_url() {
+  if [[ -n "$THREAD_ID" ]]; then
+    echo "${DISCORD_WEBHOOK_URL}?thread_id=${THREAD_ID}"
+  else
+    echo "$DISCORD_WEBHOOK_URL"
+  fi
+}
+
+# Merge global options into JSON payload
+inject_globals() {
+  local json="$1"
+  if [[ -n "$BOT_NAME" ]]; then
+    json=$(echo "$json" | jq --arg n "$BOT_NAME" '. + {username: $n}')
+  fi
+  if [[ -n "$BOT_AVATAR" ]]; then
+    json=$(echo "$json" | jq --arg a "$BOT_AVATAR" '. + {avatar_url: $a}')
+  fi
+  if [[ "$TTS" == "true" ]]; then
+    json=$(echo "$json" | jq '. + {tts: true}')
+  fi
+  echo "$json"
+}
+
+# --- Send functions ---
+
+send_message() {
+  local content="$1"
+  if (( ${#content} > 1990 )); then
+    content="${content:0:1990}..."
+  fi
+  local json
+  json=$(jq -n --arg c "$content" '{"content": $c}')
+  json=$(inject_globals "$json")
+  curl -s -o /dev/null -w "" -X POST "$(webhook_url)" \
+    -H "Content-Type: application/json" \
+    -d "$json"
+}
+
+send_embed() {
+  local title="$1"
+  local desc="$2"
+  local color="${3:-7506394}"
+  if (( ${#desc} > 4090 )); then
+    desc="${desc:0:4090}..."
+  fi
+  local json
+  json=$(jq -n --arg t "$title" --arg d "$desc" --argjson c "$color" \
+    '{"embeds": [{"title": $t, "description": $d, "color": $c, "timestamp": (now | strftime("%Y-%m-%dT%H:%M:%SZ"))}]}')
+  json=$(inject_globals "$json")
+  curl -s -o /dev/null -w "" -X POST "$(webhook_url)" \
+    -H "Content-Type: application/json" \
+    -d "$json"
+}
+
+send_file() {
+  local filepath="$1"
+  local msg="${2:-}"
+  if [[ ! -f "$filepath" ]]; then
+    echo "Error: file not found: $filepath" >&2
+    exit 1
+  fi
+  local payload='{}'
+  if [[ -n "$msg" ]]; then
+    payload=$(jq -n --arg c "$msg" '{"content": $c}')
+  fi
+  payload=$(inject_globals "$payload")
+  curl -s -o /dev/null -w "" -X POST "$(webhook_url)" \
+    -F "payload_json=$payload" \
+    -F "file=@$filepath"
+}
+
+send_files() {
+  # Args: file1 file2 ... [-- message]
+  local -a files=()
+  local msg=""
+
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--" ]]; then
+      shift
+      msg="$*"
+      break
+    fi
+    if [[ -f "$1" ]]; then
+      files+=("$1")
+    else
+      echo "Warning: skipping missing file: $1" >&2
+    fi
+    shift
+  done
+
+  if (( ${#files[@]} == 0 )); then
+    echo "Error: no files to send" >&2
+    exit 1
+  fi
+  if (( ${#files[@]} > 10 )); then
+    echo "Error: max 10 files allowed (got ${#files[@]})" >&2
+    exit 1
+  fi
+
+  local payload='{}'
+  if [[ -n "$msg" ]]; then
+    payload=$(jq -n --arg c "$msg" '{"content": $c}')
+  fi
+  payload=$(inject_globals "$payload")
+
+  local -a curl_args=(-s -o /dev/null -w "" -X POST "$(webhook_url)")
+  curl_args+=(-F "payload_json=$payload")
+  local i=0
+  for f in "${files[@]}"; do
+    if (( i == 0 )); then
+      curl_args+=(-F "file=@$f")
+    else
+      curl_args+=(-F "file${i}=@$f")
+    fi
+    ((i++))
+  done
+
+  curl "${curl_args[@]}"
+  echo "Sent ${#files[@]} file(s)"
+}
+
+send_raw() {
+  local json="$1"
+  json=$(inject_globals "$json")
+  curl -s -o /dev/null -w "" -X POST "$(webhook_url)" \
+    -H "Content-Type: application/json" \
+    -d "$json"
+}
+
+do_handoff() {
+  local user_summary="${1:-}"
+  local projects_dir="$HOME/.claude/projects/-home-$(whoami)"
+  local handoff_file="$HOME/.claude/last-handoff.json"
+
+  # Find most recent session jsonl
+  local latest_jsonl
+  latest_jsonl=$(ls -t "$projects_dir"/*.jsonl 2>/dev/null | head -1)
+  if [[ -z "$latest_jsonl" ]]; then
+    echo "Error: no Claude Code session found" >&2
+    exit 1
+  fi
+
+  local session_id
+  session_id=$(basename "$latest_jsonl" .jsonl)
+
+  # Extract session metadata (slug)
+  local slug
+  slug=$(grep -m1 -o '"slug":"[^"]*"' "$latest_jsonl" 2>/dev/null | cut -d'"' -f4 || true)
+  slug="${slug:-unknown}"
+
+  # Extract recent conversation (last 3 user/assistant pairs)
+  local context_summary
+  context_summary=$(python3 -c "
+import json, sys
+
+messages = []
+with open(sys.argv[1]) as f:
+    for line in f:
+        try:
+            obj = json.loads(line)
+            msg = obj.get('message', {})
+            role = msg.get('role', '')
+            if role in ('user', 'assistant'):
+                content = msg.get('content', '')
+                if isinstance(content, list):
+                    content = ' '.join(
+                        item.get('text', '')
+                        for item in content
+                        if isinstance(item, dict) and item.get('type') == 'text'
+                    )
+                if content and len(content) > 10:
+                    messages.append({'role': role, 'text': content[:300]})
+        except:
+            pass
+recent = messages[-6:]
+for m in recent:
+    prefix = 'User' if m['role'] == 'user' else 'Claude'
+    print(f\"{prefix}: {m['text'][:200]}\")
+    print()
+" "$latest_jsonl" 2>/dev/null)
+
+  # Save handoff file
+  jq -n \
+    --arg sid "$session_id" \
+    --arg slug "$slug" \
+    --arg jsonl "$latest_jsonl" \
+    --arg summary "$user_summary" \
+    --arg context "$context_summary" \
+    --arg ts "$(date -Iseconds)" \
+    '{
+      sessionId: $sid,
+      slug: $slug,
+      jsonlPath: $jsonl,
+      userSummary: $summary,
+      contextSummary: $context,
+      timestamp: $ts
+    }' > "$handoff_file"
+
+  echo "Handoff saved: $handoff_file"
+  echo "  Session: $session_id ($slug)"
+
+  # Send handoff notification to Discord
+  local desc="**Session**: \`${session_id:0:8}...\` ($slug)"
+  if [[ -n "$user_summary" ]]; then
+    desc="$desc\n\n**Summary**: $user_summary"
+  fi
+  if [[ -n "$context_summary" ]]; then
+    desc="$desc\n\n**Recent conversation**:\n${context_summary:0:1500}"
+  fi
+
+  send_embed "🔄 Claude Code Session Handoff" "$desc" 3447003
+}
+
+# --- Main ---
+case "${1:-}" in
+  --embed)
+    shift
+    send_embed "${1:?title required}" "${2:?description required}" "${3:-}"
+    ;;
+  --file)
+    shift
+    send_file "${1:?file path required}" "${2:-}"
+    ;;
+  --files)
+    shift
+    send_files "$@"
+    ;;
+  --rich)
+    shift
+    send_raw "${1:?JSON required}"
+    ;;
+  --handoff)
+    shift
+    do_handoff "$*"
+    ;;
+  "")
+    input=$(cat)
+    if [[ -n "$input" ]]; then
+      send_message "$input"
+    else
+      cat >&2 <<'USAGE'
+discord-notify — Discord webhook messaging tool
+
+Usage:
+  discord-notify "message"                              Text message
+  discord-notify --embed "title" "desc" [color]         Embed
+  discord-notify --file path [message]                  Single file + message
+  discord-notify --files f1 f2 ... [-- message]         Multiple files (max 10)
+  discord-notify --rich '{"embeds":[...]}'              Raw JSON
+  discord-notify --handoff "summary"                    Session handoff
+  echo "pipe" | discord-notify                          Stdin input
+
+Global options (before other options):
+  --name "Name"     Custom bot name
+  --avatar "URL"    Custom avatar
+  --thread "ID"     Send to specific thread
+  --tts             Text-to-speech
+USAGE
+      exit 1
+    fi
+    ;;
+  *)
+    send_message "$*"
+    ;;
+esac

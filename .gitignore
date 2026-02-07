@@ -1,0 +1,15 @@
+# Secrets - NEVER commit these
+*.env
+discord-webhook.env
+.env*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
