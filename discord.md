@@ -38,8 +38,58 @@ discord-notify "message content"
 discord-notify --embed "Title" "Description" [color_code]
 ```
 - Color codes (decimal, optional): purple `7506394` / green `5793266` / red `15548997` / blue `3447003` / orange `15105570`
-- Use `\n` for line breaks in description
+- ⚠️ `\n` does **not** render as a real newline — use `--rich` if you need multiple lines
+- Best for single-line notifications only
 - Timestamp auto-included
+
+### Experiment Results (recommended format)
+For structured experiment results, always use `--rich` + fields. `--embed` breaks `\n` and makes multiple metrics hard to read.
+
+```bash
+discord-notify --rich "$(jq -n \
+  --arg title "✅ Experiment Done" \
+  --arg exp "experiment name/description" \
+  --arg result "key metrics" \
+  --arg insight "unexpected finding or insight" \
+  --arg footer "runs OK • duration • GPU" \
+  --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '{
+    embeds: [{
+      title: $title,
+      color: 5793266,
+      fields: [
+        {name: "🧪 Experiment", value: $exp, inline: false},
+        {name: "📊 Results", value: $result, inline: false},
+        {name: "💡 Finding", value: $insight, inline: false}
+      ],
+      footer: {text: $footer},
+      timestamp: $ts
+    }]
+  }')"
+```
+
+For multiple metrics, use `inline: true` to display side by side:
+```bash
+discord-notify --rich "$(jq -n \
+  --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '{
+    embeds: [{
+      title: "✅ Mixed Sweep — Architect Verified",
+      color: 5793266,
+      fields: [
+        {name: "🧪 Experiment", value: "Shared vs Single-Example Features (S5 G + random M)", inline: false},
+        {name: "⚡ Grok Speed", value: "step ~7333 (G_only: 30500)\n**4× faster**", inline: true},
+        {name: "📐 G_rank/M_rank", value: "**1.343** (G > M)", inline: true},
+        {name: "🔗 Subspace Overlap", value: "**0.764**", inline: true},
+        {name: "💡 Unexpected Finding", value: "G activations higher-dim than M after grok\nMixed training accelerates grokking 4×", inline: false}
+      ],
+      footer: {text: "8/8 runs OK • 760s • 8× A100"},
+      timestamp: $ts
+    }]
+  }')"
+```
+
+> **Key**: `jq -n` handles string escaping automatically — `\n` in field values renders as real newlines in Discord.
 
 ### Single File
 ```bash
@@ -111,10 +161,16 @@ discord-notify --rich '{
 ### Sending Messages
 1. **Prepare content**: Compose message/embed content
 2. **Choose format**: Pick appropriate format based on content
-   - Short notification -> text message
-   - Structured results (experiments, analysis) -> embed or `--rich`
-   - Images, CSV, logs -> file attachment (`--file` / `--files`)
-   - Complex layout -> `--rich` (raw JSON)
+
+   | Situation | Format |
+   |-----------|--------|
+   | Short single-line alert | `discord-notify "message"` |
+   | Experiment results, multiple metrics | `--rich` + `jq -n` (fields) ← **recommended** |
+   | Images, CSV, logs | `--file` / `--files` |
+   | Simple title+description (no line breaks) | `--embed` |
+   | Custom complex layout | `--rich` directly |
+
+   > ⚠️ Do not use `--embed` for experiment results — `\n` breaks and metrics are hard to scan
 3. **Send**: Run `discord-notify`
 4. **Confirm**: Notify user of successful delivery
 
